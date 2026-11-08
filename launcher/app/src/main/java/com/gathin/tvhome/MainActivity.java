@@ -14,7 +14,6 @@ import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.ResolveInfo;
-import android.content.pm.ChangedPackages;
 import android.content.res.ColorStateList;
 import android.content.res.Resources;
 import android.graphics.Bitmap;
@@ -325,8 +324,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     private boolean resumed;
     /** Rebuild the tiles on the way back to Home only when apps changed meanwhile (TileRefresh). */
     private final TileRefresh tileRefresh = new TileRefresh();
-    /** PackageManager's change counter at the last rebuild, to catch a package broadcast that never arrived. */
-    private int packageSequence;
+    /** Inventory at the last rebuild, including updates missed while Home was stopped. */
+    private Map<String, String> packageInventory = Collections.emptyMap();
     /** The Inputs or Module cards dropdown while one is open, so onPause can close it. */
     private PopupWindow openPopup;
     /** Reorder mode is on (top-bar button). */
@@ -1231,15 +1230,9 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         }
     }
 
-    /** True when PackageManager reports apps changed since the last rebuild (one binder call). */
+    /** API25 has no change counter; compare package identities, versions, update times and enabled state. */
     private boolean packagesChangedSinceRebuild() {
-        ChangedPackages changed = getPackageManager().getChangedPackages(packageSequence);
-        return changed != null && !changed.getPackageNames().isEmpty();
-    }
-
-    private int currentPackageSequence(int since) {
-        ChangedPackages changed = getPackageManager().getChangedPackages(since);
-        return changed != null ? changed.getSequenceNumber() : since;
+        return !packageInventory.equals(InstalledPackages.read(getPackageManager()));
     }
 
     /**
@@ -1264,7 +1257,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         adapter.reload(cards.isEmpty() ? none : CardFeature.run(() -> Cards.shown(cards), none), leanback);
         lastFocusedKey = returnKey;
         lastFocused = returnSlot;
-        packageSequence = currentPackageSequence(packageSequence);
+        packageInventory = InstalledPackages.read(getPackageManager());
     }
 
     /**

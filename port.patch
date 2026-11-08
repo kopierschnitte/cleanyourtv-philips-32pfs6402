@@ -1,0 +1,240 @@
+--- upstream/launcher/app/build.gradle
++++ port/launcher/app/build.gradle
+@@ -7,14 +7,12 @@
+     compileSdk 34
+ 
+     defaultConfig {
+-        // Opt-in identity for firmware with a package-name HOME allowlist.
+-        // Xiaomi: docs/devices/xiaomi-mitv-aetp0-dofus.md (com.ts.launcher).
+-        // ColorOS TV: docs/devices/oppo-k9-55-oppocnm632.md (com.oneplus.tv.launcher2).
+-        applicationId providers.gradleProperty('launcherApplicationId').getOrElse('com.gathin.tvhome')
+-        minSdk 26
++        // Separate identity: never replace the firmware's launcher or upstream installation.
++        applicationId 'org.philips32pfs6402.home'
++        minSdk 25
+         targetSdk 34
+         versionCode 13
+-        versionName '3.4'
++        versionName '3.4-Android7'
+     }
+ 
+     buildTypes {
+@@ -37,12 +35,15 @@
+     }
+ 
+     compileOptions {
++        coreLibraryDesugaringEnabled true
+         sourceCompatibility JavaVersion.VERSION_17
+         targetCompatibility JavaVersion.VERSION_17
+     }
+ }
+ 
+ dependencies {
++    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'
++    implementation 'androidx.core:core:1.13.1'
+     implementation 'androidx.recyclerview:recyclerview:1.3.2'
+     implementation 'androidx.dynamicanimation:dynamicanimation:1.0.0'
+     // Test only (never in the APK): plain JVM tests for the module card validators, src/test.
+--- upstream/launcher/app/src/main/res/values/config.xml
++++ port/launcher/app/src/main/res/values/config.xml
+@@ -16,11 +16,8 @@
+     </string-array>
+ 
+     <!-- Apps pinned to the dock row at the bottom, in this order. Missing apps are skipped. -->
++    <!-- Populate from installed Leanback activities; no assumed third-party favorites. -->
+     <string-array name="dock_apps">
+-        <item>com.netflix.ninja</item>
+-        <item>com.amazon.amazonvideo.livingroom</item>
+-        <item>com.google.android.youtube.tv</item>
+-        <item>in.startv.hotstar</item>
+     </string-array>
+     <!-- With fewer dock_apps than columns (or a dock app that is not installed), the free dock slots take
+          the first grid apps, so the dock never shows a gap. false leaves them empty (#162); a theme can
+@@ -29,12 +26,10 @@
+ 
+     <!-- Apps never shown as tiles (e.g. the Live TV app, which the Inputs menu already covers). -->
+     <string-array name="hidden_apps">
+-        <item>com.mediatek.wwtv.tvcenter</item>
+-        <item>com.mitv.gallery</item>
+     </string-array>
+ 
+     <!-- The TV's Live TV / tuner app, offered at the end of the Inputs menu. Leave empty to omit. -->
+-    <string name="live_tv_package" translatable="false">com.mediatek.wwtv.tvcenter</string>
++    <string name="live_tv_package" translatable="false">org.droidtv.zapster</string>
+ 
+     <!-- Open the Live TV app above the first time Home comes up after the TV is switched on, for sets that are
+          mostly used for broadcast TV. Once per boot: Home after that stays Home. Can also be set with
+@@ -126,7 +121,7 @@
+          "key_filter"). Some firmware (TCL Google TV on Android 12) drops key auto-repeat once ANY service
+          filters keys, so long-pressing volume only steps once: set false and the service keeps running but
+          stops filtering, which brings repeat back at the price of the remote buttons below doing nothing. -->
+-    <bool name="key_filter">true</bool>
++    <bool name="key_filter">false</bool>
+ 
+     <!-- With key_filter on, true makes HomeKeyService and InputKeyService stop filtering keys while a game
+          controller is connected, so games see its buttons (Steam Link with an Xbox controller on a TCL G07
+@@ -267,7 +262,7 @@
+          for Arabic with Western digits), instead of the TV's. For firmware
+          that has no menu entry for the owner's language although the launcher is translated into it (a China-market
+          Xiaomi offers Chinese and English only). Empty, the default, follows the TV. A theme can set it ("locale"). -->
+-    <string name="locale" translatable="false"></string>
++    <string name="locale" translatable="false">de-DE</string>
+ 
+     <!-- A name after the greeting: "Mr. Trịnh" shows GOOD MORNING, MR. TRỊNH. Empty: the greeting alone. -->
+     <string name="greeting_name" translatable="false"></string>
+--- upstream/launcher/app/src/main/java/com/gathin/tvhome/InstalledPackages.java
++++ port/launcher/app/src/main/java/com/gathin/tvhome/InstalledPackages.java
+@@ -0,0 +1,21 @@
++package com.gathin.tvhome;
++
++import android.content.pm.PackageInfo;
++import android.content.pm.PackageManager;
++
++import java.util.HashMap;
++import java.util.Map;
++
++/** API25-safe inventory. A count alone misses replacing one package with another, and updates. */
++final class InstalledPackages {
++    private InstalledPackages() { }
++
++    static Map<String, String> read(PackageManager pm) {
++        Map<String, String> state = new HashMap<>();
++        for (PackageInfo info : pm.getInstalledPackages(0)) {
++            state.put(info.packageName, info.versionCode + ":" + info.lastUpdateTime + ":"
++                    + (info.applicationInfo != null && info.applicationInfo.enabled));
++        }
++        return state;
++    }
++}
+--- upstream/launcher/app/src/main/java/com/gathin/tvhome/MainActivity.java
++++ port/launcher/app/src/main/java/com/gathin/tvhome/MainActivity.java
+@@ -14,7 +14,6 @@
+ import android.content.pm.PackageManager;
+ import android.content.pm.ApplicationInfo;
+ import android.content.pm.ResolveInfo;
+-import android.content.pm.ChangedPackages;
+ import android.content.res.ColorStateList;
+ import android.content.res.Resources;
+ import android.graphics.Bitmap;
+@@ -325,8 +324,8 @@
+     private boolean resumed;
+     /** Rebuild the tiles on the way back to Home only when apps changed meanwhile (TileRefresh). */
+     private final TileRefresh tileRefresh = new TileRefresh();
+-    /** PackageManager's change counter at the last rebuild, to catch a package broadcast that never arrived. */
+-    private int packageSequence;
++    /** Inventory at the last rebuild, including updates missed while Home was stopped. */
++    private Map<String, String> packageInventory = Collections.emptyMap();
+     /** The Inputs or Module cards dropdown while one is open, so onPause can close it. */
+     private PopupWindow openPopup;
+     /** Reorder mode is on (top-bar button). */
+@@ -1231,15 +1230,9 @@
+         }
+     }
+ 
+-    /** True when PackageManager reports apps changed since the last rebuild (one binder call). */
++    /** API25 has no change counter; compare package identities, versions, update times and enabled state. */
+     private boolean packagesChangedSinceRebuild() {
+-        ChangedPackages changed = getPackageManager().getChangedPackages(packageSequence);
+-        return changed != null && !changed.getPackageNames().isEmpty();
+-    }
+-
+-    private int currentPackageSequence(int since) {
+-        ChangedPackages changed = getPackageManager().getChangedPackages(since);
+-        return changed != null ? changed.getSequenceNumber() : since;
++        return !packageInventory.equals(InstalledPackages.read(getPackageManager()));
+     }
+ 
+     /**
+@@ -1264,7 +1257,7 @@
+         adapter.reload(cards.isEmpty() ? none : CardFeature.run(() -> Cards.shown(cards), none), leanback);
+         lastFocusedKey = returnKey;
+         lastFocused = returnSlot;
+-        packageSequence = currentPackageSequence(packageSequence);
++        packageInventory = InstalledPackages.read(getPackageManager());
+     }
+ 
+     /**
+--- upstream/launcher/app/src/main/java/com/gathin/tvhome/WallpaperCaptions.java
++++ port/launcher/app/src/main/java/com/gathin/tvhome/WallpaperCaptions.java
+@@ -1,8 +1,11 @@
+ package com.gathin.tvhome;
+ 
+ import java.io.File;
++import java.io.BufferedReader;
++import java.io.FileInputStream;
++import java.io.InputStreamReader;
++import java.util.ArrayList;
+ import java.nio.charset.StandardCharsets;
+-import java.nio.file.Files;
+ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.List;
+@@ -38,8 +41,12 @@
+     static Map<String, String> read(File folder) {
+         File file = folder == null ? null : new File(folder, FILE_NAME);
+         if (file == null || !file.isFile() || file.length() > 256 * 1024) return Collections.emptyMap();
+-        try {
+-            return parse(Files.readAllLines(file.toPath(), StandardCharsets.UTF_8));
++        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
++                new FileInputStream(file), StandardCharsets.UTF_8))) {
++            List<String> lines = new ArrayList<>();
++            String line;
++            while ((line = reader.readLine()) != null) lines.add(line);
++            return parse(lines);
+         } catch (Exception e) {
+             return Collections.emptyMap();
+         }
+--- upstream/launcher/app/src/main/java/com/gathin/tvhome/WallpaperPlayer.java
++++ port/launcher/app/src/main/java/com/gathin/tvhome/WallpaperPlayer.java
+@@ -291,12 +291,8 @@
+             Bitmap decoded = BitmapFactory.decodeFile(file.getPath(), options);
+             if (decoded == null) return null;
+             if (dimColor != 0) new Canvas(decoded).drawColor(dimColor);
+-            // One copy in GPU memory instead of a software bitmap plus its texture; the decode stays off the UI
+-            // thread for rotations, and Home's return no longer uploads 4-8 MB to the GPU.
+-            Bitmap gpu = decoded.copy(Bitmap.Config.HARDWARE, false);
+-            if (gpu == null) return decoded;
+-            decoded.recycle();
+-            return gpu;
++            // Keep the software bitmap: Bitmap.Config.HARDWARE is unavailable on Android 7.
++            return decoded;
+         } catch (Exception | OutOfMemoryError failure) {
+             return null;
+         }
+--- upstream/launcher/app/src/main/java/com/gathin/tvhome/UiFont.java
++++ port/launcher/app/src/main/java/com/gathin/tvhome/UiFont.java
+@@ -4,6 +4,7 @@
+ import android.content.res.Resources;
+ import android.graphics.Typeface;
+ import android.util.TypedValue;
++import androidx.core.content.res.ResourcesCompat;
+ 
+ /**
+  * The typeface behind one of the font_* strings in res/values/fonts.xml, for views built in code. The string
+@@ -17,7 +18,7 @@
+         TypedValue value = new TypedValue();
+         res.getValue(fontString, value, true);
+         String name = String.valueOf(value.string);
+-        if (name.startsWith("res/")) return res.getFont(value.resourceId);
++        if (name.startsWith("res/")) return ResourcesCompat.getFont(context, value.resourceId);
+         return Typeface.create(name, Typeface.NORMAL);
+     }
+ }
+--- upstream/launcher/app/src/main/AndroidManifest.xml
++++ port/launcher/app/src/main/AndroidManifest.xml
+@@ -71,7 +71,7 @@
+     </queries>
+ 
+     <application
+-        android:label="@string/app_name"
++        android:label="@string/model_home_name"
+         android:icon="@mipmap/ic_launcher"
+         android:banner="@drawable/banner"
+         android:theme="@style/Theme.TvHome"
+--- /dev/null
++++ port/launcher/app/src/main/res/values/branding.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="model_home_name" translatable="false">Philips 32PFS6402 Home</string>
++</resources>
